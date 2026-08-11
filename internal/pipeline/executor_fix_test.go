@@ -524,7 +524,11 @@ func TestExecutor_FixClearsStoredFindingsAfterSuccessfulReRun(t *testing.T) {
 	}()
 
 	waitForStepStatus(t, database, run.ID, types.StepReview, types.StepStatusAwaitingApproval)
-	if err := exec.Respond(types.StepReview, types.ActionFix, nil); err != nil {
+	// Select the finding explicitly: a fix response that names nothing
+	// dispatches nothing, so it resolves nothing and the finding correctly
+	// stays outstanding (see
+	// TestExecutor_UnresolvedFindingsSurviveAFixResponseThatSelectsNoFindings).
+	if err := exec.Respond(types.StepReview, types.ActionFix, []string{"review-1"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -744,7 +748,8 @@ func TestExecutor_AutoFixRecordsSelectedFindingIDs(t *testing.T) {
 
 	callCount := 0
 	step := &adaptiveCallStep{
-		name: types.StepReview,
+		name:                 types.StepReview,
+		scopeLimitedFindings: true,
 		fn: func(sctx *StepContext) (*StepOutcome, error) {
 			callCount++
 			if callCount == 1 {

@@ -419,7 +419,10 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 		// user did not select here remains unresolved and must survive the
 		// resumed round loop rather than vanish if the next round reports
 		// nothing new.
-		carried := excludeFindingsJSON(gate.findings, response.findingIDs)
+		var carried string
+		if findingsMayBeScopeLimited(gate.step) {
+			carried = excludeFindingsJSON(gate.findings, response.findingIDs)
+		}
 		skipRemaining, err := e.executeStep(ctx, gate.step, gate.stepResult, run, repo, workDir, logDir, stepExecutionState{
 			fixing:           true,
 			previousFindings: merged,
@@ -464,8 +467,8 @@ func (e *Executor) recoveredGate(runID string) (*recoveredGate, error) {
 				return nil, fmt.Errorf("recovered approval gate has no complete round")
 			}
 			latest := rounds[len(rounds)-1]
-			if latest.FindingsJSON == nil || *latest.FindingsJSON != *result.FindingsJSON {
-				return nil, fmt.Errorf("recovered approval gate findings are incomplete")
+			if err := validateRecoveredGateFindings(*result.FindingsJSON, rounds, findingsMayBeScopeLimited(e.steps[index])); err != nil {
+				return nil, err
 			}
 			autoFixes := 0
 			for _, round := range rounds {
@@ -501,6 +504,65 @@ func (e *Executor) recoveredGate(runID string) (*recoveredGate, error) {
 		return nil, fmt.Errorf("recovered run has no approval gate")
 	}
 	return gate, nil
+}
+
+// validateRecoveredGateFindings checks that the parked step's findings - the
+// authoritative set the operator was shown and that Resume acts on - is fully
+// accounted for by the step's recorded round history, so a torn write between
+// the round insert and the park is caught instead of resumed against a set no
+// round ever produced.
+//
+// A step whose every round is a complete assessment writes its own round
+// output as the step findings in the same iteration, so exact equality with
+// the latest round is the tightest available statement and stays the check.
+//
+// A step that carries findings across its rounds cannot satisfy that: its
+// step findings are the union of the latest round's own output with whatever
+// remained unresolved from earlier rounds, so it is a superset - and in the
+// canonical case, a scoped rereview that found nothing new, the latest round
+// records no findings at all while the union still carries the outstanding
+// ones. The invariant that does hold there, in both directions, is
+// containment: every finding the latest round reported is in the parked set
+// (nothing this round found got lost on the way to the gate), and every
+// finding in the parked set was reported by some round of this step (nothing
+// in it was invented outside the recorded history). Identity is by content
+// fingerprint, because the union deliberately rewrites a restated finding's
+// ID and may raise its action.
+func validateRecoveredGateFindings(stepFindings string, rounds []*db.StepRound, scopeLimited bool) error {
+	latest := rounds[len(rounds)-1]
+	if !scopeLimited {
+		if latest.FindingsJSON == nil || *latest.FindingsJSON != stepFindings {
+			return fmt.Errorf("recovered approval gate findings are incomplete")
+		}
+		return nil
+	}
+
+	parked := findingFingerprintSet(stepFindings)
+	if len(parked) == 0 {
+		return fmt.Errorf("recovered approval gate findings are incomplete")
+	}
+	if latest.FindingsJSON != nil {
+		for fingerprint := range findingFingerprintSet(*latest.FindingsJSON) {
+			if !parked[fingerprint] {
+				return fmt.Errorf("recovered approval gate findings are incomplete")
+			}
+		}
+	}
+	reported := make(map[types.Finding]bool, len(parked))
+	for _, round := range rounds {
+		if round.FindingsJSON == nil {
+			continue
+		}
+		for fingerprint := range findingFingerprintSet(*round.FindingsJSON) {
+			reported[fingerprint] = true
+		}
+	}
+	for fingerprint := range parked {
+		if !reported[fingerprint] {
+			return fmt.Errorf("recovered approval gate findings are incomplete")
+		}
+	}
+	return nil
 }
 
 func (e *Executor) executeRecoveredRemainder(ctx context.Context, run *db.Run, repo *db.Repo, workDir, logDir string, start int) error {
@@ -686,7 +748,16 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 	// findings outside that diff at all). It is merged into each round's own
 	// findings below to form the step-level truth used for persistence and
 	// the completion gate.
+	//
+	// This applies ONLY to a step that declares its rounds can be scope
+	// limited (see ScopeLimitedFindingsStep). For every other step a round's
+	// own findings are a complete current assessment, so reporting less IS
+	// evidence, and each round's own output stands alone.
+	carryFindings := findingsMayBeScopeLimited(step)
 	carriedFindings := state.carriedFindings
+	if !carryFindings {
+		carriedFindings = ""
+	}
 
 	stepAgent := e.agent
 	if stepAgent != nil {
@@ -746,6 +817,8 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 
 	// Execute with possible fix loop
 	for {
+		reviewStartingHeadSHA := run.HeadSHA
+		sctx.ReviewStartingHeadSHA = reviewStartingHeadSHA
 		outcome, err := step.Execute(sctx)
 		roundNum++
 		roundDuration := time.Since(phaseStart).Milliseconds()
@@ -779,20 +852,26 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		// above). It is the step-level truth: what gets persisted as the
 		// step's findings, what the completion gate checks for outstanding
 		// ask-user items, and what the operator is shown at the approval gate.
-		// mergeFindingsJSON keeps THIS round's own summary/risk fields (it is
-		// the freshest assessment) while deduplicating identical carried items
-		// by content fingerprint, so a defect the agent legitimately restates
-		// does not pile up as a duplicate finding every round.
-		effectiveFindings := mergeFindingsJSON(outcome.Findings, carriedFindings)
-		// A fresh round's own findings are normalized against only that
-		// round's item count, so a genuinely new finding can land on the same
-		// positional ID as an unrelated finding carried forward from an
-		// earlier round. Separate any such collision before this is used for
-		// ID-based selection.
-		effectiveFindings = dedupeFindingIDsJSON(effectiveFindings, string(stepName))
-		if sanitized, stripped := sanitizeFabricatedApprovalJSON(effectiveFindings); stripped {
-			slog.Warn("stripped a risk_rationale claiming user acceptance of findings this run cannot corroborate as resolved", "step", stepName, "run", run.ID, "round", roundNum+1)
-			effectiveFindings = sanitized
+		// mergeFindingsJSON keeps THIS round's own testing summary and risk
+		// rationale (they are the freshest assessment) while deduplicating
+		// identical carried items by content fingerprint, so a defect the
+		// agent legitimately restates does not pile up as a duplicate finding
+		// every round. A restated carried finding keeps its already-shown ID
+		// and cannot have its action relaxed, and the presented count and risk
+		// level describe the union rather than only this round's own view.
+		// A step whose rounds are always a complete assessment skips all of
+		// this: its own output is the step's findings.
+		effectiveFindings := outcome.Findings
+		if carryFindings {
+			var carriedIdentities []int
+			effectiveFindings, carriedIdentities = mergeCarriedFindingsJSON(outcome.Findings, carriedFindings)
+			// A fresh round's own findings are normalized against only that
+			// round's item count, so a genuinely new finding can land on the
+			// same positional ID as an unrelated finding carried forward from
+			// an earlier round. Separate any such collision before this is
+			// used for ID-based selection, keeping the identity on whichever
+			// merged item the carried ID was actually stamped onto.
+			effectiveFindings = dedupeFindingIDsJSON(effectiveFindings, string(stepName), carriedIdentities)
 		}
 
 		if effectiveFindings != "" {
@@ -805,13 +884,23 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			}
 		}
 
-		// Persist this execution round with its own raw findings (not the
+		// Persist this execution round with its own findings (not the
 		// step-level union): the round table is a historical record of what
 		// THIS round actually reported, and a scoped re-review that legitimately
 		// found nothing new should show as having found nothing new.
+		//
+		// Its items are restated under the identities the union assigned them,
+		// because the selection recorded against this round below names union
+		// IDs, and the round record is read back with those IDs to reconstruct
+		// which findings the operator chose to fix. Two ID spaces for one item
+		// make a selected finding read as an ignored one.
+		roundFindings := outcome.Findings
+		if carryFindings {
+			roundFindings = reconcileRoundFindingIDsJSON(outcome.Findings, effectiveFindings)
+		}
 		var findingsPtr *string
-		if outcome.Findings != "" {
-			findingsPtr = &outcome.Findings
+		if roundFindings != "" {
+			findingsPtr = &roundFindings
 		}
 		var effectiveFindingsPtr *string
 		if effectiveFindings != "" {
@@ -825,7 +914,11 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		var inserted *db.StepRound
 		var dbErr error
 		if stepName == types.StepReview {
-			inserted, dbErr = e.db.InsertReviewStepRound(sr.ID, roundNum, nextTrigger, findingsPtr, fixSummaryPtr, reviewApprovedHeadSHA, roundDuration)
+			if e.config != nil && e.config.CaptureEvalProvenance {
+				inserted, dbErr = e.db.InsertReviewStepRoundWithProvenance(sr.ID, roundNum, nextTrigger, findingsPtr, fixSummaryPtr, reviewApprovedHeadSHA, reviewStartingHeadSHA, e.config.TrustedConfigSHA, e.config.ReplayGlobalYAML, e.config.ReplayRepoYAML, roundDuration)
+			} else {
+				inserted, dbErr = e.db.InsertReviewStepRound(sr.ID, roundNum, nextTrigger, findingsPtr, fixSummaryPtr, reviewApprovedHeadSHA, roundDuration)
+			}
 		} else {
 			inserted, dbErr = e.db.InsertStepRound(sr.ID, roundNum, nextTrigger, findingsPtr, fixSummaryPtr, roundDuration)
 		}
@@ -846,8 +939,19 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		// Only auto-fix findings whose action is "auto-fix".
 		// This runs before the NeedsApproval check so that all severity
 		// levels (including "info") get a chance at automatic fixing.
+		// Auto-fix eligibility is an offer this round makes about its own
+		// output, not a standing invitation over the carry set: a finding the
+		// operator saw at a gate and deliberately left unselected must not be
+		// swept into the next automatic round. Restricting the union to what
+		// this round itself reported keeps the effectiveFindings IDs (which
+		// the carry and round-selection bookkeeping below depend on) while
+		// excluding carried items no round restated.
 		if outcome.AutoFixable && autoFixLimit > 0 && autoFixAttempts < autoFixLimit {
-			fixableFindings := autoFixableFindingsJSON(effectiveFindings)
+			roundOwnFindings := effectiveFindings
+			if carryFindings {
+				roundOwnFindings = retainMatchingFindingsJSON(effectiveFindings, outcome.Findings)
+			}
+			fixableFindings := autoFixableFindingsJSON(roundOwnFindings)
 			if fixableFindings != "" {
 				autoFixAttempts++
 				telemetry.Track("fix", e.fixTelemetryFields("auto", stepName, findingsCount(fixableFindings), autoFixAttempts))
@@ -873,7 +977,9 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 				// Everything else in the current union is not being addressed
 				// this round; it must not be lost if the next round's own
 				// output does not happen to restate it.
-				carriedFindings = excludeFindingsJSON(effectiveFindings, findingIDList(fixableFindings))
+				if carryFindings {
+					carriedFindings = excludeFindingsJSON(effectiveFindings, findingIDList(fixableFindings))
+				}
 				continue
 			}
 		}
@@ -994,7 +1100,9 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			// Whatever was shown but not selected this round remains
 			// unresolved and must survive into the next round's union rather
 			// than depend on that round happening to restate it.
-			carriedFindings = excludeFindingsJSON(effectiveFindings, response.findingIDs)
+			if carryFindings {
+				carriedFindings = excludeFindingsJSON(effectiveFindings, response.findingIDs)
+			}
 			nextTrigger = "auto_fix"
 			if currentRoundID != "" {
 				allSelectedIDs := combineSelectedFindingIDs(response.findingIDs, mergedFindings)

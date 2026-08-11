@@ -242,7 +242,7 @@ Recovery takes that head by fast-forward, or by adopting a diverged preserved he
 That proof is deliberately narrow, so a rebase whose fix rounds also rewrote your own lines refuses instead of being adopted: when nothing can tell a deliberate pipeline fix from a dropped change, the decision is yours.
 A `branch_sync.state` of `user_owned` means the run went terminal before changing the submitted head and cancellation released the branch: the exact branch and head are yours and immediately usable for whichever delivery path is authorized - no sync action is needed, and a repeated `--recover` there is a harmless no-op.
 A dirty worktree, or divergence that cannot be proven contained, makes the recovery refuse with explicit choices; `--keep-local` keeps your current head while the preserved commits stay anchored under `refs/no-mistakes/recover/<run>`.
-When `next_action.code` is `recover_remote_rewritten` (state `remote_rewritten`, safety `blocked_remote_rewritten`), the live remote no longer equals the persisted pipeline push binding - it was force-updated by something outside this pipeline. Run `no-mistakes axi sync --recover` to correct the binding to the freshly verified live head; it never touches the worktree or any ref, and it re-verifies the remote itself immediately before writing, refusing rather than acting on a stale reading. Do not hand-edit any local state to work around this.
+When `next_action.code` is `recover_remote_rewritten` (state `remote_rewritten`, safety `blocked_remote_rewritten`), the live remote no longer equals the persisted pipeline push binding - it was force-updated by something outside this pipeline. Run `no-mistakes axi sync --recover` to correct the binding to the freshly verified live head; it never moves the worktree, your branch, or the gate, it anchors the superseded pipeline head under `refs/no-mistakes/recover/<run>` before writing so those commits stay reachable, and it re-verifies the remote itself immediately before writing, refusing rather than acting on a stale reading. It reports `recovery: push_binding_corrected`, not a custody return. Do not hand-edit any local state to work around this.
 If synchronization is blocked, process that structured state instead of improvising reset, stash, merge, rebase, force, or branch replacement.
 After synchronization, commit the follow-up on top and re-run `no-mistakes axi run --intent "..."` with the original user intent.
 This preserves every prior gate-fix commit regardless of its configured subject.
@@ -290,6 +290,15 @@ it to the user before you respond:
 - Ask how they want to proceed, then translate their decision into the matching
   `respond` call: `--action fix` (pass their guidance through
   `--instructions`), `--action approve`, or `--action skip`.
+- On `--action fix`, always name the findings the user chose to fix with
+  `--findings <ids>`. Only an id you name is dispatched to the fixer and
+  counted as answered. Omitting it is refused outright unless you also pass
+  `--add-finding`, and in that case the added finding is all that gets
+  fixed - every finding already on the gate stays outstanding, so the same gate
+  re-parks on the same set and will keep doing so until you select, approve, or
+  skip them. That is deliberate - a finding the user never answered must not
+  disappear - so read a repeat of the same gate as "nothing was selected yet",
+  not as the pipeline being stuck.
 
 The one exception is `--yes` (below): it is the user's standing consent to
 drive every gate unattended, so under `--yes` you resolve `ask-user`
